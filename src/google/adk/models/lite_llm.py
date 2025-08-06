@@ -54,6 +54,7 @@ from pydantic import BaseModel
 from pydantic import Field
 from typing_extensions import override
 
+from ..utils.context_utils import Aclosing
 from .base_llm import BaseLlm
 from .llm_request import LlmRequest
 from .llm_response import LlmResponse
@@ -757,78 +758,81 @@ class LiteLlm(BaseLlm):
       aggregated_llm_response_with_tool_call = None
       usage_metadata = None
       fallback_index = 0
-      async for part in await self.llm_client.acompletion(**completion_args):
-        for chunk, finish_reason in _model_response_to_chunk(part):
-          if isinstance(chunk, FunctionChunk):
-            index = chunk.index or fallback_index
-            if index not in function_calls:
-              function_calls[index] = {"name": "", "args": "", "id": None}
+      async with Aclosing(
+          await self.llm_client.acompletion(**completion_args)
+      ) as agen:
+        async for part in agen:
+          for chunk, finish_reason in _model_response_to_chunk(part):
+            if isinstance(chunk, FunctionChunk):
+              index = chunk.index or fallback_index
+              if index not in function_calls:
+                function_calls[index] = {"name": "", "args": "", "id": None}
 
-            if chunk.name:
-              function_calls[index]["name"] += chunk.name
-            if chunk.args:
-              function_calls[index]["args"] += chunk.args
+              if chunk.name:
+                function_calls[index]["name"] += chunk.name
+              if chunk.args:
+                function_calls[index]["args"] += chunk.args
 
-              # check if args is completed (workaround for improper chunk
-              # indexing)
-              try:
-                json.loads(function_calls[index]["args"])
-                fallback_index += 1
-              except json.JSONDecodeError:
-                pass
+                # check if args is completed (workaround for improper chunk
+                # indexing)
+                try:
+                  json.loads(function_calls[index]["args"])
+                  fallback_index += 1
+                except json.JSONDecodeError:
+                  pass
 
-            function_calls[index]["id"] = (
-                chunk.id or function_calls[index]["id"] or str(index)
-            )
-          elif isinstance(chunk, TextChunk):
-            text += chunk.text
-            yield _message_to_generate_content_response(
-                ChatCompletionAssistantMessage(
-                    role="assistant",
-                    content=chunk.text,
-                ),
-                is_partial=True,
-            )
-          elif isinstance(chunk, UsageMetadataChunk):
-            usage_metadata = types.GenerateContentResponseUsageMetadata(
-                prompt_token_count=chunk.prompt_tokens,
-                candidates_token_count=chunk.completion_tokens,
-                total_token_count=chunk.total_tokens,
-            )
+              function_calls[index]["id"] = (
+                  chunk.id or function_calls[index]["id"] or str(index)
+              )
+            elif isinstance(chunk, TextChunk):
+              text += chunk.text
+              yield _message_to_generate_content_response(
+                  ChatCompletionAssistantMessage(
+                      role="assistant",
+                      content=chunk.text,
+                  ),
+                  is_partial=True,
+              )
+            elif isinstance(chunk, UsageMetadataChunk):
+              usage_metadata = types.GenerateContentResponseUsageMetadata(
+                  prompt_token_count=chunk.prompt_tokens,
+                  candidates_token_count=chunk.completion_tokens,
+                  total_token_count=chunk.total_tokens,
+              )
 
-          if (
-              finish_reason == "tool_calls" or finish_reason == "stop"
-          ) and function_calls:
-            tool_calls = []
-            for index, func_data in function_calls.items():
-              if func_data["id"]:
-                tool_calls.append(
-                    ChatCompletionMessageToolCall(
-                        type="function",
-                        id=func_data["id"],
-                        function=Function(
-                            name=func_data["name"],
-                            arguments=func_data["args"],
-                            index=index,
-                        ),
-                    )
-                )
-            aggregated_llm_response_with_tool_call = (
-                _message_to_generate_content_response(
-                    ChatCompletionAssistantMessage(
-                        role="assistant",
-                        content=text,
-                        tool_calls=tool_calls,
-                    )
-                )
-            )
-            text = ""
-            function_calls.clear()
-          elif finish_reason == "stop" and text:
-            aggregated_llm_response = _message_to_generate_content_response(
-                ChatCompletionAssistantMessage(role="assistant", content=text)
-            )
-            text = ""
+            if (
+                finish_reason == "tool_calls" or finish_reason == "stop"
+            ) and function_calls:
+              tool_calls = []
+              for index, func_data in function_calls.items():
+                if func_data["id"]:
+                  tool_calls.append(
+                      ChatCompletionMessageToolCall(
+                          type="function",
+                          id=func_data["id"],
+                          function=Function(
+                              name=func_data["name"],
+                              arguments=func_data["args"],
+                              index=index,
+                          ),
+                      )
+                  )
+              aggregated_llm_response_with_tool_call = (
+                  _message_to_generate_content_response(
+                      ChatCompletionAssistantMessage(
+                          role="assistant",
+                          content=text,
+                          tool_calls=tool_calls,
+                      )
+                  )
+              )
+              text = ""
+              function_calls.clear()
+            elif finish_reason == "stop" and text:
+              aggregated_llm_response = _message_to_generate_content_response(
+                  ChatCompletionAssistantMessage(role="assistant", content=text)
+              )
+              text = ""
 
       # waiting until streaming ends to yield the llm_response as litellm tends
       # to send chunk that contains usage_metadata after the chunk with
